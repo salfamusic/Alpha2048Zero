@@ -1,0 +1,24 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+gym = "*"
+numpy = "*"
+tensorflow = "*"
+keras = "*"
+flask = "*"
+pyngrok = "*"
+flask-socketio = "*"
+eventlet = "*"
+jupyter = "*"
+requests = "*"
+flask-cors = "*"
+tqdm = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
+python_full_version = "3.11.5"
