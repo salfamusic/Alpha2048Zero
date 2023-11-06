@@ -16,6 +16,8 @@ jupyter = "*"
 requests = "*"
 flask-cors = "*"
 tqdm = "*"
+clipboard = "*"
+aiohttp = "*"
 
 [dev-packages]
 

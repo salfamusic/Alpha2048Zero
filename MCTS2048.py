@@ -4,12 +4,17 @@ from Node import Node
 
 
 class MCTS2048:
-    def __init__(self, model, iterations, env):
-        self.model = model
+    def __init__(self, model, iterations, env, initial_model=None):
         self.iterations = iterations
         self.env = env
         initial_state = env.board  # Assuming you have this method
         self.root = Node(initial_state)
+        self.primary_model = model
+        self.initial_model = initial_model if initial_model is not None else self.primary_model
+        self.model = self.initial_model
+
+    def switch_to_primary_model(self):
+        self.model = self.primary_model
 
     def reset_env(self):
         board = self.env.reset()
@@ -56,11 +61,12 @@ class MCTS2048:
     def expand_node(self, node):
         """Expand the current node using the neural network."""
         board = node.state
-        board_input = board.reshape(1, 4, 4, 1)
-        mask_input = self.env.legal_actions_mask(board).reshape(1, 4)
-        value, policy = self.model.predict([board_input, mask_input], verbose=0)
-        value = value[0]
-        policy = policy[0]
+        board_input = board.reshape(4, 4)
+        mask_input = self.env.legal_actions_mask(board).reshape(4)
+        value, policy = self.model([board_input, mask_input], training=False)
+
+        if self.env.is_game_over(board):
+            node.value = self.env.terminal_reward(board)
 
         for action in range(4):
             if not self.env.is_action_legal(board, action):
