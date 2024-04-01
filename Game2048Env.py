@@ -15,19 +15,25 @@ class Game2048Env(gym.Env):
         super(Game2048Env, self).__init__()
 
         self.window_size = window_size
+        self.step_count = 0
 
         # The action space is discrete with 4 possible moves: Up, Down, Left, Right
         self.action_space = spaces.Discrete(4)
 
         # The observation space will be a 4x4 matrix with the board state
-        self.observation_space = spaces.Box(low=0, high=MAX_TILE, shape=self.observation_shape(self.window_size), dtype=np.uint16)
+        self.observation_space = spaces.Box(low=0, high=MAX_TILE, shape=self.observation_shape(self.window_size), dtype=np.uint32)
 
         self.reset()
 
+    @property
+    def board(self):
+        return self._board.copy()
+
     def reset(self, **kwargs):
         # Reset the board to the initial state
-        self.board = np.zeros((4, 4), dtype=np.uint16)
-        self.window = np.zeros((self.window_size, 4, 4), dtype=np.uint16)
+        self.step_count = 0
+        self._board = np.zeros((4, 4), dtype=np.uint32)
+        self.window = np.zeros((self.window_size, 4, 4), dtype=np.uint32)
         self.add_tile()
         self.add_tile()
 
@@ -36,7 +42,7 @@ class Game2048Env(gym.Env):
 
     @classmethod
     def observation_shape(cls, window_size):
-        return cls.make_observation(np.zeros((4, 4), dtype=np.uint16), np.zeros((window_size, 4, 4), dtype=np.uint16)).shape
+        return cls.make_observation(np.zeros((4, 4), dtype=np.uint32), np.zeros((window_size, 4, 4), dtype=np.uint32)).shape
 
     @classmethod
     def legal_actions_mask_from_board(cls, board):
@@ -87,15 +93,11 @@ class Game2048Env(gym.Env):
     
     def step(self, action):
         # Get the resulting board state after taking an action
-        i = 0
-        while not self.is_action_legal(self.board, action):
-            action = (action + 1) % 4
-            i += 1
-            assert i < 5, "infinite loop"
+        assert self.is_action_legal(self.board, action), "Illegal action"
 
         prev_board = self.board.copy()
         merge_score = self.merge_score(self.board, action)
-        self.board = self.half_step(self.board, action)
+        self._board = self.half_step(self.board, action)
         self.window = np.array(self.window[1:].tolist() + [prev_board.tolist()])
         # Add a new tile if the board changed
 
@@ -104,6 +106,7 @@ class Game2048Env(gym.Env):
         done = self.is_game_over(self.board)
         reward = self.compute_reward(self.board, prev_board, merge_score)
 
+        self.step_count += 1
 
         if done:
             reward = self.terminal_reward(self.board)
@@ -127,25 +130,59 @@ class Game2048Env(gym.Env):
         left_board = cls.half_step(board, LEFT)
         right_board = cls.half_step(board, RIGHT)
 
-        board_transpositions = cls.make_transpositions(current_board)
+        
         up_transpositions = cls.make_transpositions(up_board)
         down_transpositions = cls.make_transpositions(down_board)
         left_transpositions = cls.make_transpositions(left_board)
         right_transpositions = cls.make_transpositions(right_board)
 
         windows_transpositions = [cls.make_transpositions(prev_board) for prev_board in window.tolist()]
+        board_transpositions = cls.make_transpositions(current_board)
 
-        segmented_state = [board_transpositions, up_transpositions, down_transpositions, left_transpositions, right_transpositions, *windows_transpositions]
+        # segmented_state = [*windows_transpositions, board_transpositions, up_transpositions, down_transpositions, left_transpositions, right_transpositions]
+        # segmented_state = [board_transpositions, up_transpositions, down_transpositions, left_transpositions, right_transpositions]
+        segmented_state = [*windows_transpositions, board_transpositions]
         state = np.concatenate(segmented_state)
 
         observation = np.array(state, dtype=np.uint32)
+
+        # # Count tiles and empty squares
+        # tile_counts = Counter(board.flatten())
+        # empty_squares = tile_counts[0]
+        # tile_counts = [tile_counts[2**i] for i in range(1, int(np.log2(MAX_TILE)) + 1)]
+
+        # # Legal moves
+        # legal_moves = cls.legal_actions_mask_from_board(board)
+
+        # # Tiles that can be merged
+        # mergeable_tiles = cls.get_mergeable_tiles(board)
+
+        # # Incorporate new features into the observation
+        # new_features = np.array([*tile_counts, empty_squares, *legal_moves, cls.step_count, *mergeable_tiles])
+        # new_features = new_features.reshape(-1, 1, 1)  # Reshape for compatibility
+
+        # observation = np.concatenate([observation, new_features], axis=0)
+
         return observation.reshape(len(segmented_state),4,4,board_transpositions.shape[-1])
-
     
-
     @classmethod
     def compute_reward(cls, board, prev_board, merge_score):
-        return np.tanh((cls.compute_static_reward(board) - cls.compute_static_reward(prev_board)) / 100) + np.log2(merge_score + 1e-7)
+        reward = 0
+
+        # Reward for merging tiles
+        reward += np.log2(merge_score + 1)
+
+        # Check if a new high-value tile was created
+        max_tile = np.max(board)
+        if max_tile > np.max(prev_board):
+            reward += np.log2(max_tile) * 0.1
+
+        return reward
+
+
+    # @classmethod
+    # def compute_reward(cls, board, prev_board, merge_score):
+    #     return np.tanh((cls.compute_static_reward(board) - cls.compute_static_reward(prev_board)) / 100) + np.log2(merge_score + 1e-7)
 
 
     @classmethod
@@ -247,28 +284,43 @@ class Game2048Env(gym.Env):
         return np.transpose(new_board), merge_score
 
     def add_tile(self):
-        empty_cells = [(i, j) for i in range(4) for j in range(4) if self.board[i, j] == 0]
+        empty_cells = [(i, j) for i in range(4) for j in range(4) if self._board[i, j] == 0]
         if empty_cells:
             i, j = empty_cells[np.random.choice(len(empty_cells))]
-            self.board[i, j] = 2 if np.random.random() < 0.9 else 4
-            return i, j, self.board[i, j]
+            self._board[i, j] = 2 if np.random.random() < 0.9 else 4
+            return i, j, self._board[i, j]
         return None, None, None
 
     @classmethod
     def is_game_over(cls, board):
         # If there are any empty cells, the game is not over
         return not np.any(cls.legal_actions_mask_from_board(board))
-
-    def save_state(self):
-        """Save the current game state."""
-        return self.board.copy()
-
-    def load_state(self, saved_state):
-        """Load a saved game state."""
-        self.board = saved_state.copy()
     
     @classmethod
+    def make_one_hot_encoding(cls, board):
+        # Define the possible tile values, including 0 for empty cells
+        tile_values = [0] + [2 ** i for i in range(1, int(np.log2(MAX_TILE)) + 1)]
+
+        # Create a dictionary to map tile values to their index in the one-hot vector
+        tile_to_index = {tile: i for i, tile in enumerate(tile_values)}
+
+        # Initialize an empty array for the one-hot encoded board
+        one_hot_board = np.zeros((4, 4, len(tile_values)), dtype=np.uint32)
+
+        # Populate the one-hot encoded board
+        for i in range(4):
+            for j in range(4):
+                tile_value = board[i][j]
+                one_hot_index = tile_to_index[tile_value]
+                one_hot_board[i][j][one_hot_index] = 1
+
+        return one_hot_board
+
+
+    @classmethod
     def make_transpositions(cls, board):
+        return cls.make_one_hot_encoding(board)
+        return np.array(board).reshape((4,4,1))
         max_board_tile = np.max(board)
         transpositions = []
 
@@ -296,7 +348,7 @@ class Game2048Env(gym.Env):
 
     @staticmethod
     def transpose_values_up(board):
-        board *= 2
+        board = board * 2
         return board
 
     @staticmethod
@@ -305,3 +357,16 @@ class Game2048Env(gym.Env):
         divided_board[divided_board == 1] = 0
         return divided_board
 
+    @classmethod
+    def get_mergeable_tiles(cls, board):
+        mergeable_tiles = np.zeros_like(board, dtype=int)
+        for i in range(4):
+            for j in range(4):
+                tile_value = board[i, j]
+                if tile_value != 0:
+                    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nx, ny = i + dx, j + dy
+                        if 0 <= nx < 4 and 0 <= ny < 4 and board[nx, ny] == tile_value:
+                            mergeable_tiles[i, j] = 1
+                            break
+        return mergeable_tiles.flatten()

@@ -1,80 +1,103 @@
+import math
+from pickle import SHORT_BINUNICODE
+from GameStepSampler import GameStepSampler, GameStepSampler2, GameStepSampler3, GameStepSampler4
+from PPOLongestGameExperienceBuffer import PPOLongestGameExperienceBuffer
+from PPOShortestGameBuffer import PPOShortestGameExperienceBuffer
+from PPOTrainingBuffer import PPOTrainingBuffer
 import numpy as np
 import tensorflow as tf
-from tqdm.notebook import tqdm
+from tqdm.notebook import tqdm, trange
+from IPython.display import clear_output
 
 from Game2048Env import Game2048Env
-from MCTS2048 import MCTS2048
 from PPOAgent import PPOAgent
 from PPOExperienceBuffer import PPOExperienceBuffer
-from webapp2048.WebApp import call_add_step
-
-# Hyperparameters
-GAMMA = 0.99
-EPOCHS = 10
-BATCH_SIZE = 64
-EPSILON = 0.2
-CLIP_VALUE = 0.2
-ACTOR_LR = 1e-4
-CRITIC_LR = 1e-4
-
-# Using Adam optimizer for both actor and critic
-actor_optimizer = tf.keras.optimizers.Adam(learning_rate=ACTOR_LR)
-critic_optimizer = tf.keras.optimizers.Adam(learning_rate=CRITIC_LR)
+from webapp2048.WebApp2 import call_add_step, call_add_training_step, call_complete_epoch, call_refresh
 
 
-# Helper functions
-def compute_discounted_returns(rewards):
-    returns = []
-    G = 0
-    for r in reversed(rewards):
-        G = r + GAMMA * G
-        returns.insert(0, G)
-    return np.array(returns)
-
-
-
-def do_epoch(batch_size, env, epoch, mcts, model):
-    buffer = PPOExperienceBuffer()
-
+def do_epoch(env, epoch, model, sampler, batch_size):
     game_count = 0
-    # pbar = tqdm(total=batch_size, desc="Buffer Filling", position=0, leave=True)
-    while buffer.size() < batch_size:
-        game_count += 1
+
+    #max_step = 10_000 if epoch == 0 else sampler.required_episode_length + 10
+    max_step = 100_000
+
+    playing_pbar = tqdm(leave=False, total=sampler.average_episodes_in_latter_half(max_step))
+
+    while not sampler.is_done_collecting_episode_steps(max_step):
         # state = mcts.reset_env()
         state = env.reset()
 
+        step = 0
+
         while True:
             # action = mcts.search(mcts.root)
-            action = model.select_action(state, env.legal_actions_mask_from_board(env.board))
+            mask = env.legal_actions_mask_from_board(env.board)
+            action, value, logits, probs = model.select_action_value_and_unmasked_logits(state, mask)
 
             if not env.is_action_legal(env.board, action):
+                print(f'{state=}')
+                print(f'{env.board=}')
+                print(f'{action=}')
+                print(f'{mask=}')
+                print(f'{probs=}')
+                print(f'{logits=}')
                 print("illegal")
 
-            logits = model.get_unmasked_logits(state)
             next_state, reward, done, extra_info = env.step(action)
             # next_random_action = extra_info['random_action']
 
-            buffer.store(state, action, reward, next_state, logits, done)
+            sampler.add_step(state, action, value, reward, next_state, logits, done)
 
             # mcts.move_to_child(next_state, action, next_random_action)
-            # pbar.update(1)
-            try:
-                call_add_step(epoch, game_count, action, env.board.tolist())
-            except Exception as e:
-                print(e)
+            call_add_step(epoch, game_count, action, env.board.tolist(), reward)
 
             state = next_state
-            if done:
+
+            step += 1
+            
+            if done or step >= max_step:
+                mask = env.legal_actions_mask_from_board(env.board)
+                _, done_state_value, _ = model.select_action_value_and_logits(state, mask)
+                sampler.end_episode(done_state_value)
+                
+                call_refresh()
+                game_count += 1
+                playing_pbar.reset(total=sampler.average_episodes_in_latter_half(max_step))
                 break
 
-    # pbar.close()
-    model.train(buffer.states, buffer.actions, buffer.rewards, buffer.next_states, buffer.logits, buffer.dones)
-    buffer.print_reward_mean()
-    buffer.clear()
 
+    clear_output(wait=True)
 
+    def buffer_to_training_buffer(buffer):
+        all_states, all_y_true_policy, all_returns = model.make_training_data(buffer.states, buffer.actions, buffer.values, buffer.next_values, buffer.rewards, buffer.next_states, buffer.logits, buffer.dones)
+        return PPOTrainingBuffer(all_states, all_y_true_policy, all_returns)
+    print("building training buffers")
+    sampler.build_training_buffers(buffer_to_training_buffer)
+    training_buffer = sampler.sample_training_steps(max_step)
+    total = training_buffer.get_number_of_batches(batch_size)
+    passes = 4
+    training_pbar = tqdm(leave=False, total=total*passes)
 
-def train_2048_ppo(model, env, mcts, epochs, batch_size):
+    train_batches(epoch, passes, batch_size, training_buffer, model, training_pbar)
+    
+    sampler.clear()
+    model.save_models("ppo")
+    call_complete_epoch(epoch)
+    clear_output(wait=True)
+
+def train_batches(epoch, passes, batch_size, training_buffer, model, training_pbar):
+    for _ in range(passes):
+        batch_num = 0
+        random_indexer = training_buffer.get_random_indexer()
+        for states, y_true_policy, returns in training_buffer.get_batches(batch_size, random_indexer):
+            # Perform training on the batch
+            ppo_loss, value_loss, lr, entropy_coefficient = model.train(states, y_true_policy, returns)
+            training_pbar.update(1)
+            training_pbar.set_description_str(f"{ppo_loss=:.5f} {value_loss=:.5f} {lr=:.5f} {entropy_coefficient=:.5f}")
+            call_add_training_step(epoch, batch_num, ppo_loss, value_loss/1000, lr, entropy_coefficient)
+            batch_num += 1
+
+def train_2048_ppo(model, env, epochs, sampler, batch_size):
     """
     Train the model for the 2048 game using the given environment and MCTS.
 
@@ -91,18 +114,18 @@ def train_2048_ppo(model, env, mcts, epochs, batch_size):
     - model: Trained model
     """
 
-    mcts.switch_to_primary_model()
-
     for epoch in range(epochs):
-        do_epoch(batch_size, env, epoch, mcts, model)
+        do_epoch(env, epoch, model, sampler, batch_size)
 
     return model
 
-def train_ppo(*, epochs, mcts_iterations, batch_size, temperature, window_size):
+def train_ppo(*, epochs, window_size, batch_size, required_number_of_latter_half_episodes_per_step):
     # Create the 2048 environment, model, and MCTS
     env = Game2048Env(window_size=window_size)
-    model = PPOAgent(env.observation_space.shape, env.action_space.n, temperature=temperature)
-    mcts = MCTS2048(model, mcts_iterations, env)
+    model = PPOAgent(env.observation_space.shape, env.action_space.n)
+    sampler = GameStepSampler4(required_number_of_latter_half_episodes_per_step)
+
+    # model.load_models('ppo')
 
     # Train the model
-    return train_2048_ppo(model, env, mcts, epochs, batch_size)
+    return train_2048_ppo(model, env, epochs, sampler, batch_size)
